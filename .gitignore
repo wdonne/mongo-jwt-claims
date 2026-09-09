@@ -1,0 +1,6 @@
+/target
+/.zed/
+/.idea/
+*.iml
+build
+Cargo.lock
