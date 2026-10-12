@@ -8,6 +8,7 @@ The format of the configuration file can be anything described in [Rust Config](
 
 |Entry|Mandatory|Default value|Description|
 |---|---|---|---|
+|cert-folder|No|None|A folder that should contain the files `tls.crt` and `tls.key`. When it is set, a TLS listener will be created.|
 |issuers|Yes|None|The array of issuers from which tokens are accepted.|
 |issuers.iss|Yes|None|The URL of the issuer.|
 |issuers.aud|No|None|The array of audiences that are accepted. It is highly recommended to set this to avoid privilege elevation issues.|

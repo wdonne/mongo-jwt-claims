@@ -17,8 +17,11 @@ use opentelemetry::global;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use otel_config::Providers;
 use otel_config::logging;
+use rustls::crypto::ring::default_provider;
 use salvo::affix_state::AffixList;
 use salvo::conn::TcpListener;
+use salvo::conn::rustls::{Keycert, RustlsConfig};
+use salvo::http::uri::Scheme;
 use salvo::otel::Metrics;
 use salvo::{Depot, Listener, Request, Response, Router, Server, Service};
 use salvo::{affix_state, handler};
@@ -28,7 +31,7 @@ use smol::lock::Mutex;
 use smol::stream::StreamExt;
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
+use std::fs::{File, read};
 use std::io::{BufReader, Read};
 use std::ops::DerefMut;
 use std::path::Path;
@@ -38,9 +41,16 @@ use std::time::SystemTime;
 
 mod error;
 
+const CERT_FOLDER: &str = "cert-folder";
 const CONFIG_FILE: &str = "CONFIG_FILE";
 const DEFAULT_CONFIG_FILE: &str = "conf/application";
-const VERSION: &str = "1.0.0";
+const JWKS_FILE: &str = "jwks-file";
+const KEY_FILE: &str = "key-file";
+const MONGO_DATABASE: &str = "mongo.database";
+const MONGO_URI: &str = "mongo.uri";
+const OTEL: &str = "otel";
+const THIS_ISSUER: &str = "this-issuer";
+const VERSION: &str = "1.1.0";
 
 #[derive(Parser)]
 struct Cli {
@@ -260,9 +270,9 @@ fn convert_to_bson(value: &str) -> Bson {
 
 async fn database(config: &Config) -> Result<Database, ServerError> {
     info!("Connecting to MongoDB");
-    Ok(Client::with_uri_str(config.get_string("mongo.uri")?)
+    Ok(Client::with_uri_str(config.get_string(MONGO_URI)?)
         .await?
-        .database(&config.get_string("mongo.database")?))
+        .database(&config.get_string(MONGO_DATABASE)?))
 }
 
 async fn decode_token(req: &Request, depot: &mut Depot) -> Result<Object, ServerError> {
@@ -546,11 +556,16 @@ async fn handle_jwt(
 }
 
 #[handler]
-async fn handle_well_known(resp: &mut Response, depot: &mut Depot) -> Result<(), ServerError> {
+async fn handle_well_known(
+    req: &Request,
+    resp: &mut Response,
+    depot: &mut Depot,
+) -> Result<(), ServerError> {
     resp.add_header("Content-Type", "application/json", true)?;
     resp.write_body(well_known(
         config_from_depot(depot)?,
         &alg_from_depot(depot).await?,
+        req.scheme(),
     )?)?;
     Ok(())
 }
@@ -591,7 +606,7 @@ fn jwks_state(config: &Config) -> Result<AffixList, ServerError> {
     debug!("Setting JWKS state");
     Ok(affix_state::inject(Arc::new(JwksState {
         loaded: Mutex::new(JwksLoaded {
-            jwks_file: config.get_string("jwks-file")?,
+            jwks_file: config.get_string(JWKS_FILE)?,
             loaded: None,
             response: "{}".to_string(),
         }),
@@ -608,7 +623,7 @@ fn key_state(config: &Config) -> Result<AffixList, ServerError> {
     debug!("Setting key state");
     Ok(affix_state::inject(Arc::new(KeyState {
         loaded: Mutex::new(KeyLoaded {
-            key_file: config.get_string("key-file")?,
+            key_file: config.get_string(KEY_FILE)?,
             loaded: None,
             signer: None,
         }),
@@ -658,8 +673,8 @@ async fn load_issuers(
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     let config = config()?;
-    let otel_providers = match config.get_table("otel").ok() {
-        Some(_) => Some(Providers::form_config(&config, "otel")?),
+    let otel_providers = match config.get_table(OTEL).ok() {
+        Some(_) => Some(Providers::form_config(&config, OTEL)?),
         None => None,
     };
     let port = Cli::parse().port.unwrap_or_default();
@@ -668,6 +683,9 @@ async fn main() -> Result<(), ServerError> {
         global::set_meter_provider(m.clone());
     }
 
+    default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     logging(&config, otel_providers.as_ref().map(|o| &o.logger_provider))?;
     info!("Version: {VERSION}");
     serve(
@@ -771,14 +789,37 @@ async fn serve(
         None => Router::new(),
     };
     let listener = TcpListener::new("0.0.0.0:".to_owned() + &port.to_string());
+    let service = service(router, &database, config).await?;
 
     debug!("Listener: {0:?}", listener);
-    Server::new(
-        TcpListener::new("0.0.0.0:".to_owned() + &port.to_string())
-            .bind()
-            .await,
-    )
-    .serve(Service::new(
+
+    if let Ok(folder) = config.get_string(CERT_FOLDER) {
+        debug!("Creating TLS listener");
+        Server::new(
+            listener
+                .rustls(RustlsConfig::new(Some(
+                    Keycert::new()
+                        .cert(read(folder.clone() + "/tls.crt")?)
+                        .key(read(folder.clone() + "/tls.key")?),
+                )))
+                .bind()
+                .await,
+        )
+        .serve(service)
+        .await;
+    } else {
+        Server::new(listener.bind().await).serve(service).await;
+    }
+
+    Ok(())
+}
+
+async fn service(
+    router: Router,
+    database: &Database,
+    config: &Config,
+) -> Result<Service, ServerError> {
+    Ok(Service::new(
         router
             .hoop(affix_state::inject(config.clone()))
             .push(Router::with_path("/auth").get(not_implemented))
@@ -792,15 +833,12 @@ async fn serve(
                             .get(handle_well_known),
                     )
                     .push(
-                        Router::with_hoop(affix_state::inject(handlers(config, &database)?))
+                        Router::with_hoop(affix_state::inject(handlers(config, database)?))
                             .hoop(issuer_state().await?)
                             .push(Router::with_path("/{**}").get(handle_jwt)),
                     ),
             ),
     ))
-    .await;
-
-    Ok(())
 }
 
 fn signer(key: &Key) -> Result<Signer, ServerError> {
@@ -848,8 +886,10 @@ async fn verified_token(
     .claims)
 }
 
-fn well_known(config: &Config, alg: &str) -> Result<String, ServerError> {
-    let issuer = &config.get_string("this-issuer")?;
+fn well_known(config: &Config, alg: &str, scheme: &Scheme) -> Result<String, ServerError> {
+    let issuer = &config
+        .get_string(THIS_ISSUER)?
+        .replace("http", scheme.as_str());
 
     Ok(Object::new()
         .add_string("issuer", issuer)
