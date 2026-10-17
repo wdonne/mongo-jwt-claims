@@ -45,3 +45,5 @@ helm repo add wdonne https://wdonne.github.io/helm
 helm repo update
 helm install mongo-jwt-claims wdonne/mongo-jwt-claims --namespace mongo-jwt-claims --create-namespace
 ```
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/wdonne/mongo-jwt-claims)
