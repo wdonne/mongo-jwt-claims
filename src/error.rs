@@ -1,5 +1,4 @@
 use config::ConfigError;
-use jwks::JwksError;
 use log::{debug, error};
 use salvo::http::StatusError;
 use salvo::{Depot, Request, Response, Writer, async_trait};
@@ -14,14 +13,14 @@ pub(crate) enum ServerError {
     Config(#[from] ConfigError),
     #[error("convert from BSON error: {0}")]
     FromBson(#[from] immutable_json::error::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("issuer state error")]
     IssuerState,
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("jwks error: {0}")]
-    Jwks(#[from] JwksError),
     #[error("jwks state error")]
     JwksState,
     #[error("JWT error: {0}")]
@@ -40,6 +39,8 @@ pub(crate) enum ServerError {
     NoHandler(String),
     #[error("no handlers")]
     NoHandlers,
+    #[error("no jwks_uri")]
+    NoJwksUri,
     #[error("no handler path")]
     NoPath,
     #[error("no signer error")]

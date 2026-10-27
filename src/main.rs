@@ -1,37 +1,30 @@
-use crate::error::ServerError;
+use crate::error::ServerError::{self, NoJwksUri};
 use bson::Bson;
 use bson::document::Document;
 use clap::Parser;
-use config::{Config, ConfigError, ValueKind};
+use config::{Config, ValueKind};
+use config_util::config;
 use immutable_json::array::Array;
 use immutable_json::bson::from_bson;
 use immutable_json::object::Object;
 use iter_util::fold_result::FoldResultExt;
 use jsonwebtoken::dangerous::insecure_decode;
+use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use jwks::Jwks;
 use log::{debug, info};
 use mongodb::{Client, Collection, Cursor, Database};
 use multimap::MultiMap;
-use opentelemetry::global;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
-use otel_config::Providers;
-use otel_config::logging;
-use rustls::crypto::ring::default_provider;
 use salvo::affix_state::AffixList;
-use salvo::conn::TcpListener;
-use salvo::conn::rustls::{Keycert, RustlsConfig};
 use salvo::http::uri::Scheme;
-use salvo::otel::Metrics;
-use salvo::{Depot, Listener, Request, Response, Router, Server, Service};
+use salvo::{Depot, Request, Response, Router};
 use salvo::{affix_state, handler};
+use salvo_from_config::Server;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol::lock::Mutex;
 use smol::stream::StreamExt;
 use std::collections::HashMap;
-use std::env;
-use std::fs::{File, read};
+use std::fs::File;
 use std::io::{BufReader, Read};
 use std::ops::DerefMut;
 use std::path::Path;
@@ -41,16 +34,12 @@ use std::time::SystemTime;
 
 mod error;
 
-const CERT_FOLDER: &str = "cert-folder";
-const CONFIG_FILE: &str = "CONFIG_FILE";
-const DEFAULT_CONFIG_FILE: &str = "conf/application";
 const JWKS_FILE: &str = "jwks-file";
 const KEY_FILE: &str = "key-file";
 const MONGO_DATABASE: &str = "mongo.database";
 const MONGO_URI: &str = "mongo.uri";
-const OTEL: &str = "otel";
 const THIS_ISSUER: &str = "this-issuer";
-const VERSION: &str = "1.1.0";
+const VERSION: &str = "1.1.1";
 
 #[derive(Parser)]
 struct Cli {
@@ -73,7 +62,7 @@ struct Handler {
 struct Issuer {
     audiences: Vec<String>,
     loaded: SystemTime,
-    jwks: Jwks,
+    jwks: JwkSet,
 }
 
 struct IssuerState {
@@ -120,6 +109,18 @@ struct TokenMetadata {
     alg: Algorithm,
     iss: String,
     kid: String,
+}
+
+impl Issuer {
+    fn get_decoding_key(&self, kid: &str) -> Result<DecodingKey, ServerError> {
+        self.jwks
+            .find(kid)
+            .and_then(|j| DecodingKey::try_from(j).ok())
+            .ok_or_else(|| {
+                debug!("KID {0} not found in reloaded JWKS", kid);
+                ServerError::Unauthorized
+            })
+    }
 }
 
 impl JwksLoaded {
@@ -209,23 +210,8 @@ fn collection(collection: &str, database: &Database) -> Collection<Document> {
     collection
 }
 
-fn config() -> Result<config::Config, ConfigError> {
-    config::Config::builder()
-        .add_source(config::File::with_name(&config_filename()))
-        .build()
-}
-
 fn config_array_to_array(array: &[config::Value]) -> bson::Array {
     array.iter().map(config_to_bson).collect()
-}
-
-fn config_filename() -> String {
-    match env::var_os(CONFIG_FILE) {
-        Some(v) => v
-            .to_str()
-            .map_or(DEFAULT_CONFIG_FILE.to_string(), |s| s.to_string()),
-        None => DEFAULT_CONFIG_FILE.to_string(),
-    }
 }
 
 fn config_from_depot(depot: &Depot) -> Result<&Config, ServerError> {
@@ -345,16 +331,19 @@ fn get_bearer_token(req: &Request) -> Option<String> {
         .map(|v| v[1].to_string())
 }
 
-fn get_decoding_key(issuer: &Issuer, kid: &str) -> Result<DecodingKey, ServerError> {
-    issuer
-        .jwks
-        .keys
-        .get(kid)
-        .map(|j| j.decoding_key.clone())
-        .ok_or_else(|| {
-            debug!("KID {0} not found in reloaded JWKS", kid);
-            ServerError::Unauthorized
-        })
+async fn get_jwk_set(issuer: &str) -> Result<JwkSet, ServerError> {
+    let body: Value = reqwest::get(issuer.to_string() + "/.well-known/openid-configuration")
+        .await?
+        .json()
+        .await?;
+    let jwks_uri = body
+        .as_object()
+        .and_then(|o| o.get("jwks_uri"))
+        .and_then(|v| v.as_str())
+        .ok_or(NoJwksUri)?;
+    let jwks: Value = reqwest::get(jwks_uri).await?.json().await?;
+
+    Ok(JwkSet::deserialize(jwks)?)
 }
 
 async fn get_jwks_response(depot: &Depot) -> Result<String, ServerError> {
@@ -446,12 +435,12 @@ async fn get_verifier(
         "Using issuer {0} with audiences {1:?}",
         issuer, loaded_issuer.audiences
     );
-    match loaded_issuer.jwks.keys.get(kid) {
-        Some(k) => Ok(k.decoding_key.clone()),
-        None => {
+    match loaded_issuer.get_decoding_key(kid) {
+        Ok(k) => Ok(k),
+        Err(_) => {
             if loaded_issuer.loaded.elapsed()?.as_secs() > 60 {
                 let new_issuer = load_issuer(issuer, &loaded_issuer.audiences).await?;
-                let result = get_decoding_key(&new_issuer, kid);
+                let result = new_issuer.get_decoding_key(kid);
 
                 issuers.insert(issuer.to_string(), new_issuer);
                 result
@@ -642,7 +631,7 @@ async fn load_issuer(issuer: &str, audiences: &[String]) -> Result<Issuer, Serve
     Ok(Issuer {
         audiences: audiences.to_vec(),
         loaded: SystemTime::now(),
-        jwks: Jwks::from_oidc_url(issuer.to_string() + "/.well-known/openid-configuration").await?,
+        jwks: get_jwk_set(issuer).await?,
     })
 }
 
@@ -671,34 +660,14 @@ async fn load_issuers(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), ServerError> {
+async fn main() -> Result<(), anyhow::Error> {
     let config = config()?;
-    let otel_providers = match config.get_table(OTEL).ok() {
-        Some(_) => Some(Providers::form_config(&config, OTEL)?),
-        None => None,
-    };
-    let port = Cli::parse().port.unwrap_or_default();
+    let server = Server::new(&config, "", Cli::parse().port.unwrap_or_default())?;
 
-    if let Some(m) = otel_providers.as_ref().map(|o| &o.meter_provider) {
-        global::set_meter_provider(m.clone());
-    }
-
-    default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
-    logging(&config, otel_providers.as_ref().map(|o| &o.logger_provider))?;
     info!("Version: {VERSION}");
-    serve(
-        port,
-        &config,
-        otel_providers.as_ref().map(|o| &o.meter_provider),
-    )
-    .await?;
-
-    if let Some(o) = otel_providers.as_ref() {
-        o.shutdown()?;
-    }
-
+    server
+        .run(router(&database(&config).await?, &config).await?)
+        .await?;
     Ok(())
 }
 
@@ -778,67 +747,22 @@ fn resolve_aggregation(
     result
 }
 
-async fn serve(
-    port: u16,
-    config: &Config,
-    meter_provider: Option<&SdkMeterProvider>,
-) -> Result<(), ServerError> {
-    let database = database(config).await?;
-    let router = match meter_provider {
-        Some(_) => Router::with_hoop(Metrics::new()),
-        None => Router::new(),
-    };
-    let listener = TcpListener::new("0.0.0.0:".to_owned() + &port.to_string());
-    let service = service(router, &database, config).await?;
-
-    debug!("Listener: {0:?}", listener);
-
-    if let Ok(folder) = config.get_string(CERT_FOLDER) {
-        debug!("Creating TLS listener");
-        Server::new(
-            listener
-                .rustls(RustlsConfig::new(Some(
-                    Keycert::new()
-                        .cert(read(folder.clone() + "/tls.crt")?)
-                        .key(read(folder.clone() + "/tls.key")?),
-                )))
-                .bind()
-                .await,
-        )
-        .serve(service)
-        .await;
-    } else {
-        Server::new(listener.bind().await).serve(service).await;
-    }
-
-    Ok(())
-}
-
-async fn service(
-    router: Router,
-    database: &Database,
-    config: &Config,
-) -> Result<Service, ServerError> {
-    Ok(Service::new(
-        router
-            .hoop(affix_state::inject(config.clone()))
-            .push(Router::with_path("/auth").get(not_implemented))
-            .push(Router::with_path("/token").get(not_implemented))
-            .hoop(jwks_state(config)?)
-            .push(Router::with_path("/jwks").get(handle_jwks))
-            .push(
-                Router::with_hoop(key_state(config)?)
-                    .push(
-                        Router::with_path("/.well-known/openid-configuration")
-                            .get(handle_well_known),
-                    )
-                    .push(
-                        Router::with_hoop(affix_state::inject(handlers(config, database)?))
-                            .hoop(issuer_state().await?)
-                            .push(Router::with_path("/{**}").get(handle_jwt)),
-                    ),
-            ),
-    ))
+async fn router(database: &Database, config: &Config) -> Result<Router, ServerError> {
+    Ok(Router::new()
+        .hoop(affix_state::inject(config.clone()))
+        .push(Router::with_path("/auth").get(not_implemented))
+        .push(Router::with_path("/token").get(not_implemented))
+        .hoop(jwks_state(config)?)
+        .push(Router::with_path("/jwks").get(handle_jwks))
+        .push(
+            Router::with_hoop(key_state(config)?)
+                .push(Router::with_path("/.well-known/openid-configuration").get(handle_well_known))
+                .push(
+                    Router::with_hoop(affix_state::inject(handlers(config, database)?))
+                        .hoop(issuer_state().await?)
+                        .push(Router::with_path("/{**}").get(handle_jwt)),
+                ),
+        ))
 }
 
 fn signer(key: &Key) -> Result<Signer, ServerError> {

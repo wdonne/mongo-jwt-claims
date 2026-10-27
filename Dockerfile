@@ -1,4 +1,4 @@
-FROM alpine:3.23.5 AS builder
+FROM alpine:3.24.3 AS builder
 ARG TARGETPLATFORM
 COPY target/aarch64-unknown-linux-musl/release/mongo-jwt-claims /target/aarch64-unknown-linux-musl/release/
 COPY target/x86_64-unknown-linux-musl/release/mongo-jwt-claims /target/x86_64-unknown-linux-musl/release/
